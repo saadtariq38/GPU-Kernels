@@ -1,0 +1,58 @@
+%%bash
+# Write the CUDA program to a file
+cat > hello_gpu_print.cu << 'EOF'
+#include <stdio.h>
+#include <cuda_runtime.h>
+#include <stdlib.h>
+
+// Define a simple struct to hold thread information.
+struct ThreadInfo {
+    int global_id;
+    int block;   // Block index
+    int thread;  // Thread index within the block
+};
+
+// Kernel that writes each thread's info into an array.
+__global__ void helloGPU(ThreadInfo* out, int total_threads) {
+    int tid = blockDim.x * blockIdx.x + threadIdx.x;
+    if (tid < total_threads) {
+        out[tid].block = blockIdx.x;
+        out[tid].thread = threadIdx.x;
+        out[tid].global_id = tid;
+    }
+}
+
+int main() {
+    int blocks = 2;
+    int threadsPerBlock = 5;
+    int total_threads = blocks * threadsPerBlock;
+
+    // Allocate device memory for the output array.
+    ThreadInfo* d_out;
+    cudaMalloc((void**)&d_out, total_threads * sizeof(ThreadInfo));
+
+    // Launch the kernel.
+    helloGPU<<<blocks, threadsPerBlock>>>(d_out, total_threads);
+    // Wait for the GPU to finish execution.
+    cudaDeviceSynchronize();
+
+    // Allocate host memory and copy the device data to the host.
+    ThreadInfo* h_out = (ThreadInfo*)malloc(total_threads * sizeof(ThreadInfo));
+    cudaMemcpy(h_out, d_out, total_threads * sizeof(ThreadInfo), cudaMemcpyDeviceToHost);
+
+    // Print the messages from the host.
+    for (int i = 0; i < total_threads; i++) {
+        printf("Hello GPU from thread %d in block %d with global id %d\n", h_out[i].thread, h_out[i].block, h_out[i].global_id);
+    }
+
+    // Free host and device memory.
+    free(h_out);
+    cudaFree(d_out);
+
+    return 0;
+}
+EOF
+
+# Compile and run the CUDA program.
+nvcc -arch=sm_70 hello_gpu_print.cu -o hello_gpu_print && ./hello_gpu_print
+
