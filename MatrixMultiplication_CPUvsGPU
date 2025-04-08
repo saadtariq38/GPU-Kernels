@@ -1,0 +1,122 @@
+%%bash
+cat > matmul.cu << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <chrono>
+
+// Macro to convert 2D indices into a 1D index.
+#define IDX(row, col, n) ((row)*(n) + (col))
+
+__global__ void matrixMulKernel(float* A, float* B, float* C, int n) {
+    int row = blockIdx.y * blockDim.y + threadIdx.y;
+    int col = blockIdx.x * blockDim.x + threadIdx.x;
+    
+    // Ensure that we are within bounds in case n is not a multiple of the block size.
+    if (row < n && col < n) {
+        float sum = 0.0f;
+        for (int k = 0; k < n; k++) {
+            sum += A[IDX(row, k, n)] * B[IDX(k, col, n)];
+        }
+        C[IDX(row, col, n)] = sum;
+    }
+}
+
+void matrixMulCPU(const float* A, const float* B, float* C, int n) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < n; k++) {
+                sum += A[i * n + k] * B[k * n + j];
+            }
+            C[i * n + j] = sum;
+        }
+    }
+}
+
+bool compareMatrices(const float* ref, const float* data, int n, float tol = 1e-3f) {
+    for (int i = 0; i < n * n; i++) {
+        if (fabs(ref[i] - data[i]) > tol) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int main() {
+    int n = 512;
+    size_t bytes = n * n * sizeof(float);
+
+    float *h_A = (float*)malloc(bytes);
+    float *h_B = (float*)malloc(bytes);
+    float *h_C = (float*)malloc(bytes);
+    float *h_C_cpu = (float*)malloc(bytes);
+    for (int i = 0; i < n * n; i++) {
+        h_A[i] = (float)rand() / RAND_MAX;
+        h_B[i] = (float)rand() / RAND_MAX;
+    }
+
+    float *d_A, *d_B, *d_C;
+    cudaMalloc((void**)&d_A, bytes);
+    cudaMalloc((void**)&d_B, bytes);
+    cudaMalloc((void**)&d_C, bytes);
+
+    cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
+
+    dim3 blockDim(16, 16);
+    dim3 gridDim((n + blockDim.x - 1) / blockDim.x,
+                 (n + blockDim.y - 1) / blockDim.y);
+
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    matrixMulKernel<<<gridDim, blockDim>>>(d_A, d_B, d_C, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+
+    float elapsedTime;
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+    printf("GPU kernel execution time: %f ms\n", elapsedTime);
+
+    cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
+
+    auto cpu_start = std::chrono::high_resolution_clock::now();
+    matrixMulCPU(h_A, h_B, h_C_cpu, n);
+    auto cpu_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> cpu_duration = cpu_end - cpu_start;
+    printf("CPU computation time: %f ms\n", cpu_duration.count());
+
+    if (compareMatrices(h_C_cpu, h_C, n)) {
+        printf("Results match!\n");
+    } else {
+        printf("Results differ!\n");
+    }
+
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    free(h_A);
+    free(h_B);
+    free(h_C);
+    free(h_C_cpu);
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return 0;
+}
+EOF
+
+# Compile the CUDA program.
+nvcc -arch=sm_70 matmul.cu -o matmul && ./matmul
