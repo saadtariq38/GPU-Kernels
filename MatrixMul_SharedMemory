@@ -1,0 +1,178 @@
+%%bash
+cat > matmul.cu << 'EOF'
+#include <stdio.h>
+#include <stdlib.h>
+#include <cuda_runtime.h>
+#include <math.h>
+#include <chrono>
+
+// Macro to convert 2D indices into a 1D index.
+#define IDX(row, col, n) ((row)*(n) + (col))
+
+// Define TILE_WIDTH as a constant. Here we choose 16.
+#define TILE_WIDTH 16
+
+// GPU Kernel: Tiled Matrix Multiplication using Shared Memory.
+__global__ void matrixMulShared(float* A, float* B, float* C, int n) {
+    // 1. Compute the global row and column index for each thread.
+    int row = blockIdx.y * TILE_WIDTH + threadIdx.y;
+    int col = blockIdx.x * TILE_WIDTH + threadIdx.x;
+    
+    // 2. Declare shared memory arrays to hold a tile (sub-matrix) from A and from B.
+    __shared__ float A_tile[TILE_WIDTH][TILE_WIDTH];
+    __shared__ float B_tile[TILE_WIDTH][TILE_WIDTH];
+    
+    float sum = 0.0f;  // This will accumulate our partial sums.
+
+    // 3. Loop over the tiles. The loop runs for ceil(n / TILE_WIDTH) iterations.
+    for (int t = 0; t < (n + TILE_WIDTH - 1) / TILE_WIDTH; t++) {
+        // --- Load data into shared memory tiles from global memory ---
+
+        // For matrix A:
+        //    The element of A to be loaded is at row 'row' and column 't * TILE_WIDTH + threadIdx.x'.
+        //    We must check that these indices are within the bounds of the matrix.
+        if (row < n && t * TILE_WIDTH + threadIdx.x < n)
+            A_tile[threadIdx.y][threadIdx.x] = A[row * n + t * TILE_WIDTH + threadIdx.x];
+        else
+            A_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        
+        // For matrix B:
+        //    The element of B to be loaded is at row 't * TILE_WIDTH + threadIdx.y' and column 'col'.
+        //    Again, boundary checking is necessary.
+        if (col < n && t * TILE_WIDTH + threadIdx.y < n)
+            B_tile[threadIdx.y][threadIdx.x] = B[(t * TILE_WIDTH + threadIdx.y) * n + col];
+        else
+            B_tile[threadIdx.y][threadIdx.x] = 0.0f;
+        
+        // Synchronize threads to ensure the tile is completely loaded.
+        __syncthreads();
+
+        // --- Compute partial sum for the current tile ---
+        // Each thread calculates the dot product for one output element.
+        for (int i = 0; i < TILE_WIDTH; i++) {
+            sum += A_tile[threadIdx.y][i] * B_tile[i][threadIdx.x];
+        }
+        
+        // Synchronize threads before loading the next tile.
+        __syncthreads();
+    }
+    
+    // 4. Write the final result to the global result matrix C.
+    if (row < n && col < n)
+        C[row * n + col] = sum;
+}
+
+// CPU Version of Matrix Multiplication (for verification and timing).
+void matrixMulCPU(const float* A, const float* B, float* C, int n) {
+    for (int i = 0; i < n; i++) {
+        for (int j = 0; j < n; j++) {
+            float sum = 0.0f;
+            for (int k = 0; k < n; k++) {
+                sum += A[i * n + k] * B[k * n + j];
+            }
+            C[i * n + j] = sum;
+        }
+    }
+}
+
+// Compare two matrices element-wise within a tolerance.
+bool compareMatrices(const float* ref, const float* data, int n, float tol = 1e-3f) {
+    for (int i = 0; i < n * n; i++) {
+        if (fabs(ref[i] - data[i]) > tol) {
+            return false;
+        }
+    }
+    return true;
+}
+
+int main() {
+    int n = 512;  // Dimension of the matrices (n x n)
+    size_t bytes = n * n * sizeof(float);
+
+    // Allocate host memory for matrices A, B, and result matrices (for both GPU and CPU versions).
+    float *h_A = (float*)malloc(bytes);
+    float *h_B = (float*)malloc(bytes);
+    float *h_C = (float*)malloc(bytes);     // To store GPU result.
+    float *h_C_cpu = (float*)malloc(bytes);   // To store CPU result.
+    
+    // Initialize matrices A and B with random values.
+    for (int i = 0; i < n * n; i++) {
+        h_A[i] = (float)rand() / RAND_MAX;
+        h_B[i] = (float)rand() / RAND_MAX;
+    }
+
+    // Allocate device memory.
+    float *d_A, *d_B, *d_C;
+    cudaMalloc((void**)&d_A, bytes);
+    cudaMalloc((void**)&d_B, bytes);
+    cudaMalloc((void**)&d_C, bytes);
+
+    // Copy matrices A and B from host to device.
+    cudaMemcpy(d_A, h_A, bytes, cudaMemcpyHostToDevice);
+    cudaMemcpy(d_B, h_B, bytes, cudaMemcpyHostToDevice);
+
+    // Define block and grid dimensions.
+    // We use a block of size TILE_WIDTH x TILE_WIDTH.
+    dim3 blockDim(TILE_WIDTH, TILE_WIDTH);
+    // The grid dimensions are computed to cover an n x n matrix.
+    dim3 gridDim((n + blockDim.x - 1) / blockDim.x,
+                 (n + blockDim.y - 1) / blockDim.y);
+
+    // Create CUDA events for timing the GPU kernel.
+    cudaEvent_t start, stop;
+    cudaEventCreate(&start);
+    cudaEventCreate(&stop);
+    cudaEventRecord(start);
+
+    // Launch the shared memory matrix multiplication kernel.
+    matrixMulShared<<<gridDim, blockDim>>>(d_A, d_B, d_C, n);
+    cudaEventRecord(stop);
+    cudaEventSynchronize(stop);
+
+    // Check for any kernel launch errors.
+    cudaError_t err = cudaGetLastError();
+    if (err != cudaSuccess) {
+        printf("CUDA kernel launch error: %s\n", cudaGetErrorString(err));
+        return -1;
+    }
+
+    // Measure GPU execution time.
+    float elapsedTime;
+    cudaEventElapsedTime(&elapsedTime, start, stop);
+    printf("GPU kernel execution time: %f ms\n", elapsedTime);
+
+    // Copy the result matrix from device to host.
+    cudaMemcpy(h_C, d_C, bytes, cudaMemcpyDeviceToHost);
+
+    // Perform matrix multiplication on the CPU for verification and timing.
+    auto cpu_start = std::chrono::high_resolution_clock::now();
+    matrixMulCPU(h_A, h_B, h_C_cpu, n);
+    auto cpu_end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double, std::milli> cpu_duration = cpu_end - cpu_start;
+    printf("CPU computation time: %f ms\n", cpu_duration.count());
+
+    // Verify that the GPU and CPU results match.
+    if (compareMatrices(h_C_cpu, h_C, n)) {
+        printf("Results match!\n");
+    } else {
+        printf("Results differ!\n");
+    }
+
+    // Free device and host memory.
+    cudaFree(d_A);
+    cudaFree(d_B);
+    cudaFree(d_C);
+    free(h_A);
+    free(h_B);
+    free(h_C);
+    free(h_C_cpu);
+    
+    cudaEventDestroy(start);
+    cudaEventDestroy(stop);
+
+    return 0;
+}
+EOF
+
+# Compile the CUDA program with an appropriate architecture flag and run.
+nvcc -arch=sm_70 matmul.cu -o matmul && ./matmul
