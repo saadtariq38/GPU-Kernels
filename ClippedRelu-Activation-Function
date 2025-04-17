@@ -1,0 +1,30 @@
+%%bash
+cat > custom_activation.cu << 'EOF'
+#include <cuda_runtime.h>
+#include <stdio.h>
+
+extern "C" {
+
+// Forward pass: Clipped ReLU
+__global__ void clipped_relu_forward(const float* input, float* output, float cap, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = input[idx];
+        float y = (x < 0.0f) ? 0.0f : x;
+        y = (y > cap) ? cap : y;
+        output[idx] = y;
+    }
+}
+
+// Backward pass: Gradient for Clipped ReLU.
+__global__ void clipped_relu_backward(const float* input, const float* grad_output, float* grad_input, float cap, int n) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx < n) {
+        float x = input[idx];
+        float grad = (x < 0.0f || x > cap) ? 0.0f : 1.0f;
+        grad_input[idx] = grad * grad_output[idx];
+    }
+}
+
+} // extern "C"
+EOF
