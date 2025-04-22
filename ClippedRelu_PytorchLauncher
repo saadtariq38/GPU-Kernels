@@ -1,0 +1,154 @@
+%%bash
+cat > custom_activation.cu <<'EOF'
+#include <cuda_runtime.h>
+#include <cstdio>
+
+// =====================
+// device kernels
+// =====================
+__global__ void clipped_relu_forward_kernel(const float* x,
+                                            float* y,
+                                            float cap,
+                                            int64_t n)
+{
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float v = x[i];
+        v = v < 0.f ? 0.f : v;
+        v = v > cap ? cap : v;
+        y[i] = v;
+    }
+}
+
+__global__ void clipped_relu_backward_kernel(const float* x,
+                                             const float* gy,
+                                             float* gx,
+                                             float cap,
+                                             int64_t n)
+{
+    int64_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    if (i < n) {
+        float g = (x[i] < 0.f || x[i] > cap) ? 0.f : 1.f;
+        gx[i] = g * gy[i];
+    }
+}
+
+extern "C" void clipped_relu_forward_launcher(const float* x,
+                                              float* y,
+                                              float cap,
+                                              int64_t n,
+                                              cudaStream_t stream)
+{
+    const int TPB = 256;
+    int blocks = (n + TPB - 1) / TPB;
+    clipped_relu_forward_kernel<<<blocks, TPB, 0, stream>>>(x, y, cap, n);
+}
+
+extern "C" void clipped_relu_backward_launcher(const float* x,
+                                               const float* gy,
+                                               float* gx,
+                                               float cap,
+                                               int64_t n,
+                                               cudaStream_t stream)
+{
+    const int TPB = 256;
+    int blocks = (n + TPB - 1) / TPB;
+    clipped_relu_backward_kernel<<<blocks, TPB, 0, stream>>>(x, gy, gx, cap, n);
+}
+EOF
+
+
+
+
+---------------------------------------------------------------------------------New Cell----------------------------------------------------------------------------------------
+
+
+!nvcc -arch=sm_75 -O3 -shared -Xcompiler -fPIC \
+      custom_activation.cu -o custom_activation.so
+
+
+
+---------------------------------------------------------------------------------New Cell----------------------------------------------------------------------------------------
+
+
+import ctypes, torch, math, os
+
+# 3.1 load the .so
+lib = ctypes.CDLL(os.path.abspath("custom_activation.so"))
+
+# 3.2 declare argtypes
+ptr = ctypes.c_void_p
+c_float = ctypes.c_float
+c_int64 = ctypes.c_longlong
+c_stream = ctypes.c_void_p   # cudaStream_t
+
+lib.clipped_relu_forward_launcher.argtypes  = [ptr, ptr, c_float, c_int64, c_stream]
+lib.clipped_relu_backward_launcher.argtypes = [ptr, ptr, ptr, c_float, c_int64, c_stream]
+# returns are void ⇒ no restype needed
+
+# 3.3 autograd Function
+class ClippedReLU(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, cap: float = 6.0):
+        x = x.contiguous()
+        y = torch.empty_like(x)
+        n = x.numel()
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+
+        lib.clipped_relu_forward_launcher(x.data_ptr(), y.data_ptr(),
+                                          c_float(cap), n, stream_ptr)
+        ctx.save_for_backward(x)
+        ctx.cap = cap
+        return y
+
+    @staticmethod
+    def backward(ctx, gy):
+        (x,) = ctx.saved_tensors
+        gy = gy.contiguous()
+        gx = torch.empty_like(x)
+        n = x.numel()
+        stream_ptr = torch.cuda.current_stream().cuda_stream
+
+        lib.clipped_relu_backward_launcher(x.data_ptr(), gy.data_ptr(), gx.data_ptr(),
+                                           c_float(ctx.cap), n, stream_ptr)
+        return gx, None          # None for cap (not learnable)
+
+# convenience wrapper
+def clipped_relu(x, cap=6.0):
+    return ClippedReLU.apply(x, float(cap))
+
+
+
+
+---------------------------------------------------------------------------------New Cell----------------------------------------------------------------------------------------
+
+
+
+# tensor
+x = torch.randn(2_000_000, device='cuda')
+
+# correctness
+y_custom = clipped_relu(x, cap=6.0)
+y_ref    = torch.clamp(x, 0.0, 6.0)
+print("match:", torch.allclose(y_custom, y_ref, atol=1e-6))
+
+# timing
+torch.cuda.synchronize()
+for _ in range(5): clipped_relu(x); torch.clamp(x, 0.0, 6.0)  # warm‑up
+
+start = torch.cuda.Event(True); end = torch.cuda.Event(True)
+
+start.record(); clipped_relu(x); end.record(); torch.cuda.synchronize()
+print("custom CUDA:  %.3f ms" % start.elapsed_time(end))
+
+start.record(); torch.clamp(x, 0.0, 6.0); end.record(); torch.cuda.synchronize()
+print("torch.clamp: %.3f ms" % start.elapsed_time(end))
+
+
+
+
+
+### OUTPUT ###
+match: True
+custom CUDA:  0.342 ms
+torch.clamp: 0.215 ms
